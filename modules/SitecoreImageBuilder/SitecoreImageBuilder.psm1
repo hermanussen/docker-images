@@ -335,6 +335,126 @@ function Invoke-Build
         }
     }
 }
+function Invoke-Build-Acr-Tasks
+{
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidUsingPlainTextForPassword", "SitecorePassword")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateScript( { Test-Path $_ -PathType "Container" })]
+        [string]$Path
+        ,
+        [Parameter(Mandatory = $true)]
+        [ValidateScript( { Test-Path $_ -PathType "Container" })]
+        [string]$InstallSourcePath
+        ,
+        [Parameter(Mandatory = $true)]
+        [string]$Registry
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$Tags = (Get-LatestSupportedVersionTags)
+        ,
+        [Parameter(Mandatory = $false)]
+        [array]$AutoGenerateWindowsVersionTags = (Get-SupportedWindowsVersions)
+        ,
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Include", "Skip")]
+        [string]$ImplicitTagsBehavior = "Include"
+        ,
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Include", "Skip")]
+        [string]$DeprecatedTagsBehavior = "Skip"
+        ,
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("Include", "Skip")]
+        [string]$ExperimentalTagBehavior = "Skip"
+    )
+
+    # Setup
+    $ErrorActionPreference = "STOP"
+    $ProgressPreference = "SilentlyContinue"
+
+    # Find out what to build
+    $specs = Initialize-BuildSpecifications -Specifications (Get-BuildSpecifications -Path $Path -AutoGenerateWindowsVersionTags $AutoGenerateWindowsVersionTags) -InstallSourcePath $InstallSourcePath -Tags $Tags -ImplicitTagsBehavior $ImplicitTagsBehavior -DeprecatedTagsBehavior $DeprecatedTagsBehavior -ExperimentalTagBehavior $ExperimentalTagBehavior
+
+    # Print results
+    $specs | Sort-Object -Property Include, Priority, Tag | Select-Object -Property Tag, Include, Deprecated, Priority, Base | Format-Table
+
+    # Determine OS
+    $osType = (docker system info --format '{{json .}}' | ConvertFrom-Json | ForEach-Object { $_.OSType })
+
+    Write-Host "### Build specifications loaded..." -ForegroundColor Green
+
+    # Start build...
+    if ($PSCmdlet.ShouldProcess("Start image builds"))
+    {
+        $specs | Where-Object { $_.Include } | ForEach-Object {
+            $spec = $_
+            $tag = $spec.Tag
+
+            Write-Host ("### Processing '{0}' using ACR Tasks..." -f $tag)
+
+            # Save the digest of previous builds for later comparison
+            $previousDigest = $null
+
+            if ((docker image ls $tag --quiet))
+            {
+                $previousDigest = (docker image inspect $tag) | ConvertFrom-Json | ForEach-Object { $_.Id }
+            }
+
+            # Copy license.xml and any missing source files into build context
+            $spec.Sources | ForEach-Object {
+                $sourcePath = $_
+
+                # continue if source file doesn't exist
+                if (!(Test-Path $sourcePath))
+                {
+                    Write-Warning "Source file '$sourcePath' is missing..."
+
+                    return
+                }
+
+                $sourceItem = Get-Item -Path $sourcePath
+                $targetPath = Join-Path $spec.Path $sourceItem.Name
+
+                if (!(Test-Path -Path $targetPath) -or ($sourceItem.Name -eq "license.xml"))
+                {
+                    Copy-Item $sourceItem -Destination $targetPath -Verbose:$VerbosePreference
+                }
+            }
+
+            # Build image
+            $buildOptions = New-Object System.Collections.Generic.List[System.Object]
+
+            if ($osType -eq "windows")
+            {
+                $buildOptions.Add("--platform windows")
+            }
+
+            $spec.BuildOptions | ForEach-Object {
+                $option = $_
+
+                if (-not ($option.StartsWith("--memory"))) # ACR tasks don't support this parameter
+                {
+                    $buildOptions.Add($option)
+                }
+            }
+
+            $buildOptions.Add("-t '$tag'")
+
+            $buildCommand = "az acr build -r $Registry {0} '{1}'" -f ($buildOptions -join " "), $spec.Path
+
+            #Write-Host ("Invoking: {0} " -f $buildCommand)
+            Write-Verbose ("Invoking: {0} " -f $buildCommand) -Verbose:$VerbosePreference
+
+            & ([scriptblock]::create($buildCommand))
+
+            $LASTEXITCODE -ne 0 | Where-Object { $_ } | ForEach-Object { throw "Failed: $buildCommand" }
+
+            Write-Host ("### Done with '$fulltag', image now available in $Registry.") -ForegroundColor Green
+        }
+    }
+}
 
 function Initialize-BuildSpecifications
 {
